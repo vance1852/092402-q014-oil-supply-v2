@@ -34,8 +34,74 @@ ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "emissions.read"},
+    "emissions": {
+        "emissions.factor.write",
+        "emissions.receipt.write",
+        "emissions.statement.preview",
+        "emissions.statement.seal",
+        "emissions.adjustment.write",
+        "emissions.read",
+    },
 }
+
+
+def fetch_active_user(connection: sqlite3.Connection, user_id: str) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM supply_users WHERE user_id=?", (user_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFound("用户不存在")
+    if not row["active"]:
+        raise Forbidden("用户已停用")
+    return row
+
+
+def require_permission(connection: sqlite3.Connection, user_id: str, permission: str) -> sqlite3.Row:
+    user = fetch_active_user(connection, user_id)
+    if permission not in ROLE_PERMISSIONS[user["role"]]:
+        raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
+    return user
+
+
+def append_audit_event(
+    connection: sqlite3.Connection,
+    *,
+    entity_type: str,
+    entity_id: str,
+    event_type: str,
+    actor_id: str,
+    payload: Mapping[str, Any],
+    created_at: str,
+) -> None:
+    previous = connection.execute(
+        "SELECT event_hash FROM supply_audit_events ORDER BY event_id DESC LIMIT 1"
+    ).fetchone()
+    previous_hash = "0" * 64 if previous is None else previous["event_hash"]
+    body = {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "event_type": event_type,
+        "actor_id": actor_id,
+        "payload": payload,
+        "created_at": created_at,
+        "previous_hash": previous_hash,
+    }
+    event_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+    connection.execute(
+        "INSERT INTO supply_audit_events(entity_type,entity_id,event_type,actor_id,payload_json,"
+        "previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (
+            entity_type,
+            entity_id,
+            event_type,
+            actor_id,
+            canonical_json(payload),
+            previous_hash,
+            event_hash,
+            created_at,
+        ),
+    )
 
 
 class SupplyService:
@@ -48,20 +114,10 @@ class SupplyService:
         return utc_text(self.clock.now())
 
     def _user(self, user_id: str) -> sqlite3.Row:
-        row = self.connection.execute(
-            "SELECT * FROM supply_users WHERE user_id=?", (user_id,)
-        ).fetchone()
-        if row is None:
-            raise NotFound("用户不存在")
-        if not row["active"]:
-            raise Forbidden("用户已停用")
-        return row
+        return fetch_active_user(self.connection, user_id)
 
     def _require(self, user_id: str, permission: str) -> sqlite3.Row:
-        user = self._user(user_id)
-        if permission not in ROLE_PERMISSIONS[user["role"]]:
-            raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
-        return user
+        return require_permission(self.connection, user_id, permission)
 
     def _audit(
         self,
@@ -71,33 +127,14 @@ class SupplyService:
         actor_id: str,
         payload: Mapping[str, Any],
     ) -> None:
-        previous = self.connection.execute(
-            "SELECT event_hash FROM supply_audit_events ORDER BY event_id DESC LIMIT 1"
-        ).fetchone()
-        previous_hash = "0" * 64 if previous is None else previous["event_hash"]
-        body = {
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "event_type": event_type,
-            "actor_id": actor_id,
-            "payload": payload,
-            "created_at": self._now(),
-            "previous_hash": previous_hash,
-        }
-        event_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
-        self.connection.execute(
-            "INSERT INTO supply_audit_events(entity_type,entity_id,event_type,actor_id,payload_json,"
-            "previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                entity_type,
-                entity_id,
-                event_type,
-                actor_id,
-                canonical_json(payload),
-                previous_hash,
-                event_hash,
-                body["created_at"],
-            ),
+        append_audit_event(
+            self.connection,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            event_type=event_type,
+            actor_id=actor_id,
+            payload=payload,
+            created_at=self._now(),
         )
 
     def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:

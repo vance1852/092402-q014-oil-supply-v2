@@ -9,14 +9,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .clock import FrozenClock
+from .emissions import EmissionsService
 from .service import SupplyService
 
 
 def run(workspace: Path) -> dict[str, object]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
-    service = SupplyService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
-    for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
+    clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
+    service = SupplyService(connection, clock)
+    emissions = EmissionsService(connection, clock)
+    for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor"), ("carbon", "emissions")):
         service.create_user(user_id, user_id, role)
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
         service.record_quote("plan", {"price_index": "BRENT", "trade_date": f"2026-09-{index}", "close_usd": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
@@ -30,7 +33,15 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键管道恢复与需求回落", "price_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("BRENT"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    emissions.register_factor("carbon", {"route_id": "pipe-a-b", "product": "crude", "retrofit_stage": "pre_retrofit", "factor_value": "0.42", "effective_from": "2026-01-01T00:00:00Z"})
+    emissions.register_factor("carbon", {"route_id": "pipe-a-b", "product": "crude", "retrofit_stage": "post_retrofit", "factor_value": "0.36", "effective_from": "2026-09-01T00:00:00Z"})
+    clock.advance(hours=40)
+    entry = emissions.record_receipt("carbon", {"transfer_id": "transfer-001", "signed_barrels": "79700", "signed_at": "2026-09-26T00:00:00Z"})
+    emissions.statement("carbon", "2026Q3")
+    sealed = emissions.seal_statement("carbon", "2026Q3")
+    empty_quarter = emissions.seal_statement("carbon", "2026Q2")
+    export = emissions.export_quarter("audit", "2026Q3")
+    result = {"status": "ok", "price": service.price_summary("BRENT"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "emissions": {"entry": entry, "sealed_quarter": sealed["quarter"], "sealed_totals": sealed["totals"]["grand"], "empty_quarter_totals": empty_quarter["totals"]["grand"], "export_sha256": export["content_sha256"]}, "workspace": workspace.name}
     connection.close()
     return result
 

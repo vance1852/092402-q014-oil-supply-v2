@@ -12,6 +12,8 @@ from typing import Iterable, Mapping, Sequence
 ZERO = Decimal("0")
 HUNDRED = Decimal("100")
 BASIS_POINTS = Decimal("10000")
+EMISSION_QUANTUM = Decimal("0.001")
+FACTOR_QUANTUM = Decimal("0.000001")
 
 
 def quantize_volume(value: Decimal) -> Decimal:
@@ -20,6 +22,14 @@ def quantize_volume(value: Decimal) -> Decimal:
 
 def quantize_money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def quantize_emission(value: Decimal) -> Decimal:
+    return value.quantize(EMISSION_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def quantize_factor(value: Decimal) -> Decimal:
+    return value.quantize(FACTOR_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def decimal_text(value: Decimal) -> str:

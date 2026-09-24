@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
+from .emissions import EmissionsService
 from .errors import SupplyError, ValidationFailed
 from .service import SupplyService
 from .storage import connect
@@ -22,8 +23,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, emissions: EmissionsService | None = None) -> None:
         self.service = service
+        self.emissions = emissions or EmissionsService(service.connection, service.clock)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -85,6 +87,22 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "POST" and path == "/emissions/factors":
+                return Response(201, self.emissions.register_factor(actor, payload))
+            if method == "GET" and path == "/emissions/factors":
+                return Response(200, self.emissions.list_factors(actor, query.get("route_id", [""])[0], query.get("product", [""])[0]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["emissions", "factors"] and parts[3] == "retire":
+                return Response(200, self.emissions.retire_factor(actor, int(parts[2])))
+            if method == "POST" and path == "/emissions/receipts":
+                return Response(201, self.emissions.record_receipt(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["emissions", "statements"]:
+                return Response(200, self.emissions.statement(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["emissions", "statements"] and parts[3] == "seal":
+                return Response(200, self.emissions.seal_statement(actor, parts[2]))
+            if method == "POST" and path == "/emissions/adjustments":
+                return Response(201, self.emissions.open_adjustment(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["emissions", "entries"]:
+                return Response(200, self.emissions.entry_for_transfer(actor, parts[2]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

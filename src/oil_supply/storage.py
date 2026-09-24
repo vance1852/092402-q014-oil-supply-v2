@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','emissions')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -178,6 +178,92 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(scope, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS emission_factors (
+    factor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    product TEXT NOT NULL,
+    retrofit_stage TEXT NOT NULL CHECK(retrofit_stage IN ('pre_retrofit','post_retrofit')),
+    factor_value TEXT NOT NULL,
+    effective_from TEXT NOT NULL,
+    referenced INTEGER NOT NULL DEFAULT 0 CHECK(referenced IN (0,1)),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(route_id, product, effective_from)
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_factors_window
+ON emission_factors(route_id, product, effective_from);
+
+CREATE TABLE IF NOT EXISTS transfer_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id TEXT NOT NULL UNIQUE REFERENCES transfers(transfer_id),
+    signed_barrels TEXT NOT NULL,
+    standard_loss_barrels TEXT NOT NULL,
+    disputed_loss_barrels TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    quarter TEXT NOT NULL,
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_receipts_quarter
+ON transfer_receipts(quarter, signed_at);
+
+CREATE TABLE IF NOT EXISTS emission_adjustments (
+    adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjustment_type TEXT NOT NULL CHECK(adjustment_type IN ('late_receipt','factor_correction')),
+    source_quarter TEXT NOT NULL,
+    target_quarter TEXT NOT NULL,
+    transfer_id TEXT REFERENCES transfers(transfer_id),
+    receipt_id INTEGER REFERENCES transfer_receipts(receipt_id),
+    route_id TEXT,
+    product TEXT,
+    signed_barrels TEXT NOT NULL,
+    standard_loss_barrels TEXT NOT NULL,
+    disputed_loss_barrels TEXT NOT NULL,
+    delta_emissions_kg TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    precision_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_adjustments_target
+ON emission_adjustments(target_quarter, adjustment_id);
+
+CREATE TABLE IF NOT EXISTS emission_entries (
+    entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id INTEGER NOT NULL UNIQUE REFERENCES transfer_receipts(receipt_id),
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    product TEXT NOT NULL,
+    quarter TEXT NOT NULL,
+    signed_barrels TEXT NOT NULL,
+    factor_id INTEGER NOT NULL REFERENCES emission_factors(factor_id),
+    factor_value TEXT NOT NULL,
+    retrofit_stage TEXT NOT NULL,
+    factor_effective_from TEXT NOT NULL,
+    emissions_kg TEXT NOT NULL,
+    quantity_quantum TEXT NOT NULL,
+    emission_quantum TEXT NOT NULL,
+    factor_quantum TEXT NOT NULL,
+    rounding TEXT NOT NULL,
+    adjustment_id INTEGER REFERENCES emission_adjustments(adjustment_id),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_entries_quarter
+ON emission_entries(quarter, route_id, product);
+
+CREATE TABLE IF NOT EXISTS emission_statements (
+    quarter TEXT PRIMARY KEY,
+    sealed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    sealed_at TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS supply_audit_events (
