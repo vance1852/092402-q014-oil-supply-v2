@@ -10,6 +10,9 @@
 - 库存批次保留油品、牌号、数量、单位成本和接收时间，可计算加权库存成本；
 - 托运提名支持载荷级幂等、优先级分配、库存扣减和在途交接；
 - 供应情景保存价格变化、线路能力变化和需求变化，审批后产生可重放的确定性结果；
+- 运输排放按季度核算：能耗因子按线路、油品和生效时间保存互不重叠的版本，封存引用后不可修改；
+- 排放只按最终签收数量计算，标准损耗与争议损耗分别呈现，因子快照和精度规则随报表固化；
+- 季度封存前负责人可预览，封存后迟到签收或因子更正只能开调整单滚入下一期；
 - 关键写操作进入哈希串联审计日志，可离线验证事件顺序和内容完整性。
 
 现场准入子域位于 `robot_trials` 包，负责油田巡检机器人的设备构建登记、不可变试验协议、观测分片导入、异常观测复核、统计任务租约、准入决定和审计报告。该子域不连接机器人硬件，只处理已经结构化的试验记录。
@@ -61,10 +64,32 @@ PYTHONPATH=src python3 -m oil_supply.acceptance --workspace .
 PYTHONPATH=src python3 -m robot_trials.acceptance --workspace .
 ```
 
+## 排放核算与季度封存
+
+排放核算子域面向审计抽查：从季度排放总额可以直接下钻到每笔已签收转运，并看到当时采用的是设备改造前还是改造后的能耗因子，历史季度不会被最新因子回算。
+
+核算口径：
+
+- 能耗因子按（线路、油品、生效时间）保存互不重叠的版本，生效区间为半开区间 `[effective_from, effective_to)`；
+- 转运适用的因子以发运时间为准，转运按签收时间归属季度；
+- 排放只按最终签收数量计算，标准损耗（装船量减预计交付量）与争议损耗（预计交付量减签收量）分别呈现；
+- 季度封存时固化因子快照和精度规则（数量三位、排放三位、ROUND_HALF_UP），封存报表不再变化；
+- 因子被引用进封存报表后，其数值、设备代次和生效起点不可修改，只允许设置生效止点以衔接下一版本；
+- 季度未封存时负责人可以预览；封存后迟到签收自动开 `late_signoff` 调整单、因子更正通过 `factor_correction` 调整单，滚入下一个未封存季度；
+- 零运输量季度给出全零合计，跨期在途转运在报表 `excluded_in_transit` 中明确列出。
+
+命令行导出（明细按签收时间和转运编号排序，内容摘要在相同数据下保持稳定）：
+
+```bash
+PYTHONPATH=src python3 -m oil_supply.emissions_cli --database oil_supply.sqlite3 --quarter 2026Q3 --actor-id audit
+```
+
+对应 HTTP 接口包括 `POST /emissions/factors`、`POST /emissions/factors/{id}/correct`、`GET /emissions/factors`、`POST /emissions/factor-corrections`、`POST /transfers/{id}/signoff`、`GET /emissions/quarters/{id}/preview`、`POST /emissions/quarters/{id}/seal`、`GET /emissions/quarters/{id}` 和 `GET /emissions/quarters/{id}/export`。新增角色 `emissions_officer` 负责因子维护和季度封存，审计角色可读取封存报表并导出。
+
 ## HTTP 服务
 
 ```bash
 PYTHONPATH=src python3 -m oil_supply.api --database oil_supply.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、设施、线路、停运事件、库存批次、提名、能力分配、发运、供应情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、设施、线路、停运事件、库存批次、提名、能力分配、发运、签收、排放核算、供应情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。

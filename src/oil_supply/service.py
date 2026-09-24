@@ -10,8 +10,31 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
+from .emissions import (
+    DEFAULT_PRECISION,
+    build_statement,
+    export_document,
+    next_quarter,
+    parse_quarter,
+    quarter_bounds,
+    quarter_of,
+    ranges_overlap,
+    resolve_factor,
+    transfer_emission,
+)
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    EmissionFactorInput,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -32,9 +55,10 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "transfer.sign", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "emission.read"},
+    "emissions_officer": {"factor.write", "emission.read", "quarter.preview", "quarter.seal", "adjustment.write"},
 }
 
 
@@ -569,3 +593,547 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    @staticmethod
+    def _factor_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "factor_id": row["factor_id"],
+            "route_id": row["route_id"],
+            "product": row["product"],
+            "kgco2e_per_barrel": row["kgco2e_per_barrel"],
+            "equipment_generation": row["equipment_generation"],
+            "effective_from": row["effective_from"],
+            "effective_to": row["effective_to"],
+        }
+
+    def _factor_versions(self, route_id: str, product: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM emission_factor_versions WHERE route_id=? AND product=? "
+            "ORDER BY effective_from,factor_id",
+            (route_id, product),
+        ).fetchall()
+
+    def _factor_for(self, route_id: str, product: str, moment) -> sqlite3.Row:
+        version = resolve_factor(self._factor_versions(route_id, product), moment)
+        if version is None:
+            raise InvalidState(f"线路 {route_id} 的 {product} 在 {utc_text(moment)} 没有适用的能耗因子版本")
+        return version
+
+    def _ensure_factor_span_free(self, route_id, product, start, end, exclude) -> None:
+        rows = self.connection.execute(
+            "SELECT factor_id,effective_from,effective_to FROM emission_factor_versions "
+            "WHERE route_id=? AND product=?",
+            (route_id, product),
+        ).fetchall()
+        for row in rows:
+            if row["factor_id"] == exclude:
+                continue
+            other_start = parse_utc(row["effective_from"], "effective_from")
+            other_end = None if row["effective_to"] is None else parse_utc(row["effective_to"], "effective_to")
+            if ranges_overlap(start, end, other_start, other_end):
+                raise Conflict(f"因子生效区间与版本 {row['factor_id']} 重叠")
+
+    def _valid_quarter(self, quarter_id: str) -> str:
+        try:
+            parse_quarter(quarter_id)
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return quarter_id
+
+    def _quarter_state(self, quarter_id: str) -> str:
+        row = self.connection.execute(
+            "SELECT state FROM emission_quarters WHERE quarter_id=?", (quarter_id,)
+        ).fetchone()
+        return "open" if row is None else row["state"]
+
+    def _ensure_quarter(self, quarter_id: str) -> None:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO emission_quarters(quarter_id,created_at) VALUES(?,?)",
+            (quarter_id, self._now()),
+        )
+
+    def _earliest_open_quarter_after(self, quarter_id: str) -> str:
+        candidate = next_quarter(quarter_id)
+        while self._quarter_state(candidate) == "sealed":
+            candidate = next_quarter(candidate)
+        return candidate
+
+    def emission_factor(self, factor_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM emission_factor_versions WHERE factor_id=?", (factor_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("因子版本不存在")
+        return dict(row)
+
+    def register_emission_factor(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "factor.write")
+        factor = EmissionFactorInput.from_dict(raw)
+        route = self.route(factor.route_id)
+        if route["product"] != factor.product:
+            raise Conflict("因子油品与线路油品不一致")
+        start = parse_utc(factor.effective_from, "effective_from")
+        end = None if factor.effective_to is None else parse_utc(factor.effective_to, "effective_to")
+        self._ensure_factor_span_free(factor.route_id, factor.product, start, end, exclude=None)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO emission_factor_versions(factor_id,route_id,product,kgco2e_per_barrel,"
+                    "equipment_generation,effective_from,effective_to,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        factor.factor_id,
+                        factor.route_id,
+                        factor.product,
+                        decimal_text(factor.kgco2e_per_barrel),
+                        factor.equipment_generation,
+                        factor.effective_from,
+                        factor.effective_to,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "emission_factor",
+                    factor.factor_id,
+                    "factor.registered",
+                    actor_id,
+                    {"route_id": factor.route_id, "product": factor.product, "effective_from": factor.effective_from},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("因子编号已经存在") from exc
+        return self.emission_factor(factor.factor_id)
+
+    def correct_emission_factor(self, actor_id: str, factor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "factor.write")
+        row = self.connection.execute(
+            "SELECT * FROM emission_factor_versions WHERE factor_id=?", (factor_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("因子版本不存在")
+        referenced = self.connection.execute(
+            "SELECT 1 FROM emission_statement_factors f "
+            "JOIN emission_quarters q ON q.quarter_id=f.quarter_id "
+            "WHERE f.factor_id=? AND q.state='sealed' LIMIT 1",
+            (factor_id,),
+        ).fetchone()
+        merged = {
+            "factor_id": row["factor_id"],
+            "route_id": row["route_id"],
+            "product": row["product"],
+            "kgco2e_per_barrel": raw.get("kgco2e_per_barrel", row["kgco2e_per_barrel"]),
+            "equipment_generation": raw.get("equipment_generation", row["equipment_generation"]),
+            "effective_from": raw.get("effective_from", row["effective_from"]),
+            "effective_to": raw["effective_to"] if "effective_to" in raw else row["effective_to"],
+        }
+        factor = EmissionFactorInput.from_dict(merged)
+        if referenced is not None:
+            # 封存报表已固化因子快照，历史不可回算；因子值、设备代次和生效起点随之锁定，
+            # 只允许调整生效止点，以便衔接后续版本且不影响已封存的核算结果。
+            frozen = (
+                decimal_text(factor.kgco2e_per_barrel) != row["kgco2e_per_barrel"]
+                or factor.equipment_generation != row["equipment_generation"]
+                or factor.effective_from != row["effective_from"]
+            )
+            if frozen:
+                raise Conflict("因子已被封存核算引用，不能修改，请开调整单滚入下一期")
+        start = parse_utc(factor.effective_from, "effective_from")
+        end = None if factor.effective_to is None else parse_utc(factor.effective_to, "effective_to")
+        self._ensure_factor_span_free(factor.route_id, factor.product, start, end, exclude=factor_id)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE emission_factor_versions SET kgco2e_per_barrel=?,equipment_generation=?,"
+                "effective_from=?,effective_to=?,revision=revision+1 WHERE factor_id=? AND revision=?",
+                (
+                    decimal_text(factor.kgco2e_per_barrel),
+                    factor.equipment_generation,
+                    factor.effective_from,
+                    factor.effective_to,
+                    factor_id,
+                    row["revision"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("因子版本已被并发修改")
+            self._audit("emission_factor", factor_id, "factor.corrected", actor_id, {"revision": row["revision"] + 1})
+        return self.emission_factor(factor_id)
+
+    def list_emission_factors(self, actor_id: str, route_id: str, product: str) -> dict[str, Any]:
+        self._require(actor_id, "emission.read")
+        route_id = identifier(route_id, "route_id")
+        product = required_text(product, "product", 32)
+        return {
+            "route_id": route_id,
+            "product": product,
+            "versions": [self._factor_dict(row) for row in self._factor_versions(route_id, product)],
+        }
+
+    def sign_transfer(self, actor_id: str, transfer_id: str, signed_barrels: object, signed_at: object) -> dict[str, Any]:
+        self._require(actor_id, "transfer.sign")
+        transfer = self.connection.execute(
+            "SELECT * FROM transfers WHERE transfer_id=?", (transfer_id,)
+        ).fetchone()
+        if transfer is None:
+            raise NotFound("转运不存在")
+        if transfer["state"] != "in_transit":
+            raise InvalidState("转运不在在途状态，不能签收")
+        signed = decimal_value(signed_barrels, "signed_barrels", minimum=Decimal("0"))
+        if signed > Decimal(transfer["loaded_barrels"]):
+            raise ValidationFailed("签收数量不能超过装船数量")
+        try:
+            signed_dt = parse_utc(required_text(signed_at, "signed_at", 40), "signed_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        departed_dt = parse_utc(transfer["departed_at"], "departed_at")
+        if signed_dt < departed_dt:
+            raise ValidationFailed("签收时间不能早于发运时间")
+        if signed_dt > self.clock.now():
+            raise ValidationFailed("签收时间不能晚于当前时间")
+        quarter_id = quarter_of(signed_dt)
+        signed_text = decimal_text(DEFAULT_PRECISION.volume(signed))
+        adjustment = None
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO transfer_signoffs(transfer_id,signed_barrels,signed_at,signed_by,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (transfer_id, signed_text, utc_text(signed_dt), actor_id, self._now()),
+            )
+            cursor = self.connection.execute(
+                "UPDATE transfers SET state='delivered',arrived_at=?,revision=revision+1 "
+                "WHERE transfer_id=? AND state='in_transit'",
+                (utc_text(signed_dt), transfer_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("转运不在在途状态，不能签收")
+            self.connection.execute(
+                "UPDATE nominations SET state='delivered',delivered_barrels=?,revision=revision+1 "
+                "WHERE nomination_id=?",
+                (signed_text, transfer["nomination_id"]),
+            )
+            self._audit(
+                "transfer",
+                transfer_id,
+                "transfer.signed",
+                actor_id,
+                {"signed_barrels": signed_text, "signed_at": utc_text(signed_dt), "quarter_id": quarter_id},
+            )
+            if self._quarter_state(quarter_id) == "sealed":
+                adjustment = self._create_late_signoff_adjustment(actor_id, transfer, signed, signed_dt, quarter_id)
+        result = {
+            "transfer_id": transfer_id,
+            "state": "delivered",
+            "signed_barrels": signed_text,
+            "quarter_id": quarter_id,
+        }
+        if adjustment is not None:
+            result["adjustment"] = adjustment
+        return result
+
+    def _create_late_signoff_adjustment(
+        self,
+        actor_id: str,
+        transfer: sqlite3.Row,
+        signed: Decimal,
+        signed_dt,
+        source_quarter_id: str,
+    ) -> dict[str, Any]:
+        route = self.connection.execute(
+            "SELECT n.route_id,r.product FROM nominations n JOIN routes r ON r.route_id=n.route_id "
+            "WHERE n.nomination_id=?",
+            (transfer["nomination_id"],),
+        ).fetchone()
+        departed_dt = parse_utc(transfer["departed_at"], "departed_at")
+        factor = self._factor_for(route["route_id"], route["product"], departed_dt)
+        quantities = transfer_emission(
+            loaded=Decimal(transfer["loaded_barrels"]),
+            expected_delivered=Decimal(transfer["expected_delivered_barrels"]),
+            signed=signed,
+            kgco2e_per_barrel=Decimal(factor["kgco2e_per_barrel"]),
+        )
+        target = self._earliest_open_quarter_after(source_quarter_id)
+        self._ensure_quarter(target)
+        adjustment_id = f"adj-late-{transfer['transfer_id']}"
+        detail = {
+            "factor": self._factor_dict(factor),
+            "signed_at": utc_text(signed_dt),
+            "standard_loss_barrels": quantities["standard_loss_barrels"],
+            "disputed_loss_barrels": quantities["disputed_loss_barrels"],
+        }
+        self.connection.execute(
+            "INSERT INTO emission_adjustments(adjustment_id,quarter_id,source_quarter_id,kind,transfer_id,"
+            "factor_id,delta_barrels,delta_kgco2e,reason,detail_json,created_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                adjustment_id,
+                target,
+                source_quarter_id,
+                "late_signoff",
+                transfer["transfer_id"],
+                factor["factor_id"],
+                quantities["signed_barrels"],
+                quantities["kgco2e"],
+                "迟到签收滚入下一期",
+                canonical_json(detail),
+                actor_id,
+                self._now(),
+            ),
+        )
+        self._audit(
+            "emission_adjustment",
+            adjustment_id,
+            "adjustment.created",
+            actor_id,
+            {"kind": "late_signoff", "quarter_id": target, "source_quarter_id": source_quarter_id},
+        )
+        row = self.connection.execute(
+            "SELECT * FROM emission_adjustments WHERE adjustment_id=?", (adjustment_id,)
+        ).fetchone()
+        return self._adjustment_dict(row)
+
+    @staticmethod
+    def _adjustment_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "adjustment_id": row["adjustment_id"],
+            "kind": row["kind"],
+            "quarter_id": row["quarter_id"],
+            "source_quarter_id": row["source_quarter_id"],
+            "transfer_id": row["transfer_id"],
+            "factor_id": row["factor_id"],
+            "delta_barrels": row["delta_barrels"],
+            "delta_kgco2e": row["delta_kgco2e"],
+            "reason": row["reason"],
+            "detail": json.loads(row["detail_json"]),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
+    def _build_quarter_statement(self, quarter_id: str) -> dict[str, Any]:
+        start, end = quarter_bounds(quarter_id)
+        rows = self.connection.execute(
+            "SELECT t.transfer_id,t.departed_at,t.loaded_barrels,t.expected_delivered_barrels,"
+            "s.signed_barrels,s.signed_at,n.route_id,r.product "
+            "FROM transfer_signoffs s "
+            "JOIN transfers t ON t.transfer_id=s.transfer_id "
+            "JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "JOIN routes r ON r.route_id=n.route_id"
+        ).fetchall()
+        versions_cache: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        lines: list[dict[str, Any]] = []
+        for row in rows:
+            signed_dt = parse_utc(row["signed_at"], "signed_at")
+            if not start <= signed_dt < end:
+                continue
+            key = (row["route_id"], row["product"])
+            if key not in versions_cache:
+                versions_cache[key] = self._factor_versions(*key)
+            departed_dt = parse_utc(row["departed_at"], "departed_at")
+            factor = resolve_factor(versions_cache[key], departed_dt)
+            if factor is None:
+                raise InvalidState(
+                    f"转运 {row['transfer_id']} 在 {utc_text(departed_dt)} 没有适用的能耗因子版本"
+                )
+            quantities = transfer_emission(
+                loaded=Decimal(row["loaded_barrels"]),
+                expected_delivered=Decimal(row["expected_delivered_barrels"]),
+                signed=Decimal(row["signed_barrels"]),
+                kgco2e_per_barrel=Decimal(factor["kgco2e_per_barrel"]),
+            )
+            lines.append({
+                "transfer_id": row["transfer_id"],
+                "route_id": row["route_id"],
+                "product": row["product"],
+                "departed_at": row["departed_at"],
+                "signed_at": row["signed_at"],
+                "loaded_barrels": row["loaded_barrels"],
+                "expected_delivered_barrels": row["expected_delivered_barrels"],
+                **quantities,
+                "factor": self._factor_dict(factor),
+            })
+        excluded_rows = self.connection.execute(
+            "SELECT t.transfer_id,t.departed_at,t.state,s.signed_at FROM transfers t "
+            "LEFT JOIN transfer_signoffs s ON s.transfer_id=t.transfer_id"
+        ).fetchall()
+        excluded: list[dict[str, Any]] = []
+        for row in excluded_rows:
+            departed_dt = parse_utc(row["departed_at"], "departed_at")
+            if departed_dt >= end:
+                continue
+            if row["signed_at"] is not None and parse_utc(row["signed_at"], "signed_at") < end:
+                continue
+            excluded.append({
+                "transfer_id": row["transfer_id"],
+                "departed_at": row["departed_at"],
+                "state": row["state"],
+            })
+        adjustments = [
+            self._adjustment_dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM emission_adjustments WHERE quarter_id=? ORDER BY adjustment_id",
+                (quarter_id,),
+            ).fetchall()
+        ]
+        return build_statement(
+            quarter_id=quarter_id,
+            lines=lines,
+            adjustments=adjustments,
+            excluded_in_transit=excluded,
+        )
+
+    def preview_quarter(self, actor_id: str, quarter_id: str) -> dict[str, Any]:
+        self._require(actor_id, "quarter.preview")
+        self._valid_quarter(quarter_id)
+        if self._quarter_state(quarter_id) == "sealed":
+            raise InvalidState("季度已封存，请读取封存报表")
+        return {**self._build_quarter_statement(quarter_id), "state": "open"}
+
+    def seal_quarter(self, actor_id: str, quarter_id: str) -> dict[str, Any]:
+        self._require(actor_id, "quarter.seal")
+        self._valid_quarter(quarter_id)
+        if self._quarter_state(quarter_id) == "sealed":
+            raise InvalidState("季度已经封存")
+        statement = self._build_quarter_statement(quarter_id)
+        sealed_at = self._now()
+        stored = {**statement, "state": "sealed", "sealed_by": actor_id, "sealed_at": sealed_at}
+        factor_ids = {line["factor"]["factor_id"] for line in statement["lines"]}
+        for adjustment in statement["adjustments"]:
+            if adjustment["factor_id"]:
+                factor_ids.add(adjustment["factor_id"])
+            detail_factor = adjustment["detail"].get("factor")
+            if detail_factor:
+                factor_ids.add(detail_factor["factor_id"])
+        with transaction(self.connection, immediate=True):
+            self._ensure_quarter(quarter_id)
+            cursor = self.connection.execute(
+                "UPDATE emission_quarters SET state='sealed',sealed_by=?,sealed_at=?,statement_json=?,"
+                "statement_sha256=? WHERE quarter_id=? AND state='open'",
+                (actor_id, sealed_at, canonical_json(stored), statement["statement_sha256"], quarter_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("季度已经封存")
+            for factor_id in sorted(factor_ids):
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO emission_statement_factors(quarter_id,factor_id) VALUES(?,?)",
+                    (quarter_id, factor_id),
+                )
+            self._audit(
+                "emission_quarter",
+                quarter_id,
+                "quarter.sealed",
+                actor_id,
+                {"statement_sha256": statement["statement_sha256"]},
+            )
+        return stored
+
+    def quarter_statement(self, actor_id: str, quarter_id: str) -> dict[str, Any]:
+        self._require(actor_id, "emission.read")
+        self._valid_quarter(quarter_id)
+        row = self.connection.execute(
+            "SELECT * FROM emission_quarters WHERE quarter_id=?", (quarter_id,)
+        ).fetchone()
+        if row is None or row["state"] != "sealed":
+            raise InvalidState("季度尚未封存，请使用预览")
+        return json.loads(row["statement_json"])
+
+    def create_factor_correction(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "adjustment.write")
+        factor_id = identifier(raw.get("factor_id"), "factor_id")
+        corrected = decimal_value(
+            raw.get("corrected_kgco2e_per_barrel"),
+            "corrected_kgco2e_per_barrel",
+            minimum=Decimal("0"),
+            maximum=Decimal("100000"),
+        )
+        reason = required_text(raw.get("reason"), "reason")
+        factor = self.emission_factor(factor_id)
+        refs = self.connection.execute(
+            "SELECT q.quarter_id,q.statement_json FROM emission_statement_factors f "
+            "JOIN emission_quarters q ON q.quarter_id=f.quarter_id "
+            "WHERE f.factor_id=? AND q.state='sealed' ORDER BY q.quarter_id",
+            (factor_id,),
+        ).fetchall()
+        if not refs:
+            raise InvalidState("因子未被封存核算引用，可直接更正")
+        created: list[dict[str, Any]] = []
+        with transaction(self.connection, immediate=True):
+            for ref in refs:
+                statement = json.loads(ref["statement_json"])
+                affected = [
+                    line for line in statement["lines"] if line["factor"]["factor_id"] == factor_id
+                ]
+                if not affected:
+                    continue
+                delta = sum(
+                    (
+                        DEFAULT_PRECISION.emission(
+                            (corrected - Decimal(line["factor"]["kgco2e_per_barrel"]))
+                            * Decimal(line["signed_barrels"])
+                        )
+                        for line in affected
+                    ),
+                    Decimal("0"),
+                )
+                delta = DEFAULT_PRECISION.emission(delta)
+                if delta == Decimal("0"):
+                    continue
+                source_quarter_id = ref["quarter_id"]
+                target = self._earliest_open_quarter_after(source_quarter_id)
+                self._ensure_quarter(target)
+                sequence = self.connection.execute(
+                    "SELECT count(*) FROM emission_adjustments WHERE kind='factor_correction' "
+                    "AND factor_id=? AND source_quarter_id=?",
+                    (factor_id, source_quarter_id),
+                ).fetchone()[0]
+                adjustment_id = f"adj-fc-{factor_id}-{source_quarter_id}"
+                if sequence:
+                    adjustment_id = f"{adjustment_id}-{sequence + 1}"
+                affected_barrels = sum((Decimal(line["signed_barrels"]) for line in affected), Decimal("0"))
+                detail = {
+                    "original_kgco2e_per_barrel": factor["kgco2e_per_barrel"],
+                    "corrected_kgco2e_per_barrel": decimal_text(corrected),
+                    "affected_transfer_count": len(affected),
+                    "affected_signed_barrels": decimal_text(DEFAULT_PRECISION.volume(affected_barrels)),
+                }
+                self.connection.execute(
+                    "INSERT INTO emission_adjustments(adjustment_id,quarter_id,source_quarter_id,kind,"
+                    "transfer_id,factor_id,delta_barrels,delta_kgco2e,reason,detail_json,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        adjustment_id,
+                        target,
+                        source_quarter_id,
+                        "factor_correction",
+                        None,
+                        factor_id,
+                        decimal_text(DEFAULT_PRECISION.volume(Decimal("0"))),
+                        decimal_text(delta),
+                        reason,
+                        canonical_json(detail),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "emission_adjustment",
+                    adjustment_id,
+                    "adjustment.created",
+                    actor_id,
+                    {"kind": "factor_correction", "quarter_id": target, "source_quarter_id": source_quarter_id},
+                )
+                created.append(
+                    self._adjustment_dict(
+                        self.connection.execute(
+                            "SELECT * FROM emission_adjustments WHERE adjustment_id=?", (adjustment_id,)
+                        ).fetchone()
+                    )
+                )
+        return {"factor_id": factor_id, "adjustments": created}
+
+    def export_quarter(self, actor_id: str, quarter_id: str) -> dict[str, Any]:
+        self._require(actor_id, "emission.read")
+        self._valid_quarter(quarter_id)
+        row = self.connection.execute(
+            "SELECT statement_json,state FROM emission_quarters WHERE quarter_id=?", (quarter_id,)
+        ).fetchone()
+        if row is not None and row["state"] == "sealed":
+            return export_document(json.loads(row["statement_json"]), state="sealed")
+        return export_document(self._build_quarter_statement(quarter_id), state="open")

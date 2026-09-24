@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','emissions_officer')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -179,6 +179,68 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     created_at TEXT NOT NULL,
     PRIMARY KEY(scope, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS emission_factor_versions (
+    factor_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    product TEXT NOT NULL,
+    kgco2e_per_barrel TEXT NOT NULL,
+    equipment_generation TEXT NOT NULL
+        CHECK(equipment_generation IN ('pre_retrofit','post_retrofit')),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_factors_span
+ON emission_factor_versions(route_id, product, effective_from);
+
+CREATE TABLE IF NOT EXISTS transfer_signoffs (
+    transfer_id TEXT PRIMARY KEY REFERENCES transfers(transfer_id),
+    signed_barrels TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    signed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_signoffs_signed_at
+ON transfer_signoffs(signed_at);
+
+CREATE TABLE IF NOT EXISTS emission_quarters (
+    quarter_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','sealed')),
+    sealed_by TEXT REFERENCES supply_users(user_id),
+    sealed_at TEXT,
+    statement_json TEXT,
+    statement_sha256 TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS emission_statement_factors (
+    quarter_id TEXT NOT NULL REFERENCES emission_quarters(quarter_id),
+    factor_id TEXT NOT NULL REFERENCES emission_factor_versions(factor_id),
+    PRIMARY KEY(quarter_id, factor_id)
+);
+
+CREATE TABLE IF NOT EXISTS emission_adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    quarter_id TEXT NOT NULL REFERENCES emission_quarters(quarter_id),
+    source_quarter_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('late_signoff','factor_correction')),
+    transfer_id TEXT REFERENCES transfers(transfer_id),
+    factor_id TEXT REFERENCES emission_factor_versions(factor_id),
+    delta_barrels TEXT NOT NULL,
+    delta_kgco2e TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_adjustments_quarter
+ON emission_adjustments(quarter_id, adjustment_id);
 
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,

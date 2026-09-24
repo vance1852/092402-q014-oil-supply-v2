@@ -77,6 +77,24 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "signoff":
+                return Response(200, self.service.sign_transfer(actor, parts[1], payload["signed_barrels"], payload["signed_at"]))
+            if method == "POST" and path == "/emissions/factors":
+                return Response(201, self.service.register_emission_factor(actor, payload))
+            if method == "GET" and path == "/emissions/factors":
+                return Response(200, self.service.list_emission_factors(actor, query.get("route_id", [""])[0], query.get("product", [""])[0]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["emissions", "factors"] and parts[3] == "correct":
+                return Response(200, self.service.correct_emission_factor(actor, parts[2], payload))
+            if method == "POST" and path == "/emissions/factor-corrections":
+                return Response(201, self.service.create_factor_correction(actor, payload))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["emissions", "quarters"] and parts[3] == "preview":
+                return Response(200, self.service.preview_quarter(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["emissions", "quarters"] and parts[3] == "seal":
+                return Response(200, self.service.seal_quarter(actor, parts[2]))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["emissions", "quarters"]:
+                return Response(200, self.service.quarter_statement(actor, parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["emissions", "quarters"] and parts[3] == "export":
+                return Response(200, self.service.export_quarter(actor, parts[2]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":

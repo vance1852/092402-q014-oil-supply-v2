@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import parse_utc, utc_text
 from .errors import ValidationFailed
 
 
@@ -219,6 +219,54 @@ class NominationRequest:
             ),
             priority=priority,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EmissionFactorInput:
+    factor_id: str
+    route_id: str
+    product: str
+    kgco2e_per_barrel: Decimal
+    equipment_generation: str
+    effective_from: str
+    effective_to: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "EmissionFactorInput":
+        product = required_text(raw.get("product"), "product", 32)
+        if product not in PRODUCTS:
+            raise ValidationFailed("product 不是受支持的油品")
+        generation = required_text(raw.get("equipment_generation"), "equipment_generation", 24)
+        if generation not in {"pre_retrofit", "post_retrofit"}:
+            raise ValidationFailed("equipment_generation 必须是 pre_retrofit 或 post_retrofit")
+        effective_from = required_text(raw.get("effective_from"), "effective_from", 40)
+        try:
+            start = parse_utc(effective_from, "effective_from")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        end = None
+        effective_to = raw.get("effective_to")
+        if effective_to is not None:
+            try:
+                end = parse_utc(required_text(effective_to, "effective_to", 40), "effective_to")
+            except ValueError as exc:
+                raise ValidationFailed(str(exc)) from exc
+            if end <= start:
+                raise ValidationFailed("effective_to 必须晚于 effective_from")
+        return cls(
+            factor_id=identifier(raw.get("factor_id"), "factor_id"),
+            route_id=identifier(raw.get("route_id"), "route_id"),
+            product=product,
+            kgco2e_per_barrel=decimal_value(
+                raw.get("kgco2e_per_barrel"),
+                "kgco2e_per_barrel",
+                minimum=Decimal("0"),
+                maximum=Decimal("100000"),
+            ),
+            equipment_generation=generation,
+            effective_from=utc_text(start),
+            effective_to=None if end is None else utc_text(end),
         )
 
 
